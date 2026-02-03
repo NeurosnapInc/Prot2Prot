@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=59.6.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prot2prop"
+version = "2026.02.03"
+authors = [
+  {name="Keaun Amani"},
+]
+description = "Models for protein property prediction (WIP)."
+license = {file = "LICENSE"}
+readme = "README.md"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "Development Status :: 3 - Alpha",
+]
+requires-python = ">=3.8"
+dependencies = [
+  "torch",
+  "transformers",
+  "sentencepiece",
+]
+
+[project.optional-dependencies]
+dev = [
+  "datasets",
+  "scikit-learn",
+  "tqdm",
+  "ruff",
+  "tiktoken",
+  "protobuf",
+]
+
+[project.urls]
+Homepage = "https://github.com/NeurosnapInc/TODO"
+Issues = "https://github.com/NeurosnapInc/TODO/issues"
+
+[tool.setuptools]
+py-modules = ["inference", "train"]
+
+[tool.ruff]
+line-length = 150
+indent-width = 2
