@@ -31,6 +31,8 @@ Properties for future investigation (lower priority and potentially less synergi
 - Disorder content / intrinsically disordered regions
 - PTM site likelihood (phosphorylation, glycosylation, ubiquitination, acetylation)
 
+> I suggest we ignore these for the time being, as they all require some degree of auxiliary information. For example, binding affinity depends on interaction partners, while enzymatic activity and kcat are only meaningful with substrate information. Without this context, I'm of the opinion that these properties would be of limited value. That said, I’ve kept them listed to provide a sense of future direction for the project, once the initial set of primary properties has been implemented.
+
 ## Motivation
 The current ecosystem provides many task-specific models for properties such as solubility and stability, but few efforts unify these objectives within a single, structure-aware model. A multi-property framework can reduce parameter count and improve throughput, while potentially improving accuracy through shared signal across correlated biochemical traits (e.g., stability-related metrics).
 
