@@ -48,7 +48,8 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
-## Results
+## Results (WIP)
+### Crude Solubility Results for Reference
 ```sh
 Epoch 1/3: 100%|???????????| 7810/7810 [1:05:11<00:00,  2.00it/s]
 Train Loss: 0.5971 | Val Acc: 0.7097 F1: 0.7000
