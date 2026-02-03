@@ -1,4 +1,4 @@
-# Prot2Prot
+# Prot2Prop
 Structure-aware fine-tuning of protein language models for joint prediction of multiple developability properties from protein structure inputs.
 
 ## Objectives
