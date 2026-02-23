@@ -1,106 +1,285 @@
 """
-Aggregate multiple protein-property datasets into a unified multi-task corpus.
+Aggregate protein-property datasets into a DuckDB database.
 
-The output is a normalized dataset on disk with a consistent schema:
-sequence, structure, structure_format, task, label, label_type, source, split.
+Tables:
+- samples(sequence, source, task_name, label)
+  - UNIQUE(sequence, task_name)
+- tasks(task_name, dtype, head_type, num_classes, loss)
+  - PRIMARY KEY(task_name)
 """
 
 import argparse
-import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from datasets import concatenate_datasets, load_dataset
+import duckdb
+from datasets import load_dataset
 
 
 @dataclass(frozen=True)
 class TaskSpec:
   # Dataset configuration for one property task.
-  name: str
+  # `dtype` drives label coercion (all labels are stored as float in `samples`).
+  # `head_type`, `num_classes`, and `loss` are training metadata for downstream loaders.
+  task_name: str
   dataset: str
-  split: Iterable[str]
-  sequence_col: str
-  label_col: Optional[str]
-  label_type: str
-  structure_col: Optional[str] = None
-  structure_format: Optional[str] = None
+  dtype: str
+  head_type: str
+  num_classes: Optional[int]
+  loss: str
+  splits: Iterable[str] = ("train", "validation", "test")
+  sequence_col: Optional[str] = None
+  label_col: Optional[str] = None
   subset: Optional[str] = None
 
 
 TASKS: List[TaskSpec] = [
-  # Example task. Extend this list with additional properties/datasets.
+  # Material production as sequence-level binary classification.
   TaskSpec(
-    name="solubility",
+    task_name="material_production",
+    dataset="AI4Protein/material_production",
+    dtype="bool",
+    head_type="sequence_binary",
+    num_classes=2,
+    loss="bce",
+  ),
+  # DeepSol has a known non-default sequence column (`aa_seq`).
+  TaskSpec(
+    task_name="solubility",
     dataset="AI4Protein/DeepSol",
-    split=("train", "validation", "test"),
+    dtype="bool",
+    head_type="sequence_binary",
+    num_classes=2,
+    loss="bce",
     sequence_col="aa_seq",
     label_col="label",
-    label_type="binary",
-    structure_col=None,
-    structure_format=None,
-    subset=None,
+  ),
+  # Temperature stability modeled as sequence-level regression.
+  TaskSpec(
+    task_name="temperature_stability",
+    dataset="AI4Protein/temperature_stability",
+    dtype="float",
+    head_type="sequence_regression",
+    num_classes=None,
+    loss="mse",
   ),
 ]
 
 
-def _normalize_example(example: Dict[str, Any], task: TaskSpec, split: str) -> Dict[str, Any]:
-  # Map a dataset-specific record into the unified schema.
-  sequence = example.get(task.sequence_col)
-  label = example.get(task.label_col) if task.label_col else None
-  structure = example.get(task.structure_col) if task.structure_col else None
-  return {
-    "sequence": sequence,
-    "structure": structure,
-    "structure_format": task.structure_format,
-    "task": task.name,
-    "label": label,
-    "label_type": task.label_type,
-    "source": task.dataset if task.subset is None else f"{task.dataset}:{task.subset}",
-    "split": split,
-  }
+SEQ_COL_CANDIDATES = (
+  "sequence",
+  "aa_seq",
+  "protein_sequence",
+  "seq",
+)
+
+LABEL_COL_CANDIDATES = (
+  "label",
+  "target",
+  "y",
+  "value",
+)
 
 
-def _load_and_map(task: TaskSpec, split: str, cache_dir: Optional[str]):
-  # Load one split and normalize columns to the unified schema.
-  ds = load_dataset(task.dataset, task.subset, split=split, cache_dir=cache_dir)
-  return ds.map(
-    lambda ex: _normalize_example(ex, task, split),
-    remove_columns=ds.column_names,
-    desc=f"Normalize {task.name}:{split}",
+def _resolve_column(column_names: List[str], preferred: Optional[str], candidates: Iterable[str], kind: str, task_name: str) -> str:
+  # Pick a preferred column, else the first matching candidate.
+  # This keeps task definitions short while still handling common schema variants.
+  if preferred is not None:
+    if preferred not in column_names:
+      raise KeyError(f"Task '{task_name}' expected {kind} column '{preferred}', but columns are: {column_names}")
+    return preferred
+
+  for candidate in candidates:
+    if candidate in column_names:
+      return candidate
+
+  raise KeyError(f"Task '{task_name}' could not infer a {kind} column from columns: {column_names}")
+
+
+def _coerce_label(value: Any, dtype: str) -> Optional[float]:
+  # Convert all labels to float; skip missing/empty labels.
+  # Downstream training can cast back to bool/int based on `tasks.dtype`.
+  if value is None:
+    return None
+
+  if isinstance(value, str):
+    stripped = value.strip()
+    if stripped == "":
+      return None
+    if dtype == "bool":
+      lowered = stripped.lower()
+      if lowered in ("true", "t", "yes", "y", "1", "positive", "pos"):
+        return 1.0
+      if lowered in ("false", "f", "no", "n", "0", "negative", "neg"):
+        return 0.0
+      return float(stripped)
+    return float(stripped)
+
+  if dtype == "bool":
+    if isinstance(value, bool):
+      return 1.0 if value else 0.0
+    return 1.0 if float(value) > 0 else 0.0
+
+  if dtype == "int":
+    return float(int(value))
+
+  return float(value)
+
+
+def _prepare_db(con: duckdb.DuckDBPyConnection):
+  # Create target tables with required constraints.
+  # The script intentionally recreates tables from scratch on each run.
+  con.execute("DROP TABLE IF EXISTS samples")
+  con.execute("DROP TABLE IF EXISTS tasks")
+
+  con.execute(
+    """
+    CREATE TABLE tasks (
+      task_name VARCHAR PRIMARY KEY,
+      dtype VARCHAR NOT NULL,
+      head_type VARCHAR NOT NULL,
+      num_classes INTEGER,
+      loss VARCHAR NOT NULL
+    )
+    """
+  )
+
+  con.execute(
+    """
+    CREATE TABLE samples (
+      sequence VARCHAR NOT NULL,
+      source VARCHAR NOT NULL,
+      task_name VARCHAR NOT NULL,
+      label DOUBLE NOT NULL,
+      -- Uniqueness Constraints: one label per (sequence, task_name).
+      CONSTRAINT samples_sequence_task_unique UNIQUE(sequence, task_name),
+      FOREIGN KEY (task_name) REFERENCES tasks(task_name)
+    )
+    """
   )
 
 
-def aggregate(tasks: List[TaskSpec], out_dir: Path, cache_dir: Optional[str]):
-  # Build a single concatenated dataset from all tasks/splits.
-  out_dir.mkdir(parents=True, exist_ok=True)
+def _insert_task(con: duckdb.DuckDBPyConnection, task: TaskSpec):
+  # One metadata row per task head.
+  con.execute(
+    """
+    INSERT INTO tasks(task_name, dtype, head_type, num_classes, loss)
+    VALUES (?, ?, ?, ?, ?)
+    """,
+    [task.task_name, task.dtype, task.head_type, task.num_classes, task.loss],
+  )
 
-  mapped_parts = []
-  for task in tasks:
-    for split in task.split:
-      # Load + normalize per-task split before concatenation.
-      mapped_parts.append(_load_and_map(task, split, cache_dir))
 
-  if not mapped_parts:
-    raise ValueError("No tasks/splits to aggregate.")
+def _iter_selected_splits(task: TaskSpec, ds_dict: Dict[str, Any]) -> List[str]:
+  # Keep configured split order while selecting only splits present in the dataset.
+  # If none of the expected split names exist, process every split provided.
+  available = set(ds_dict.keys())
+  selected = [split for split in task.splits if split in available]
+  if selected:
+    return selected
+  return list(ds_dict.keys())
 
-  combined = concatenate_datasets(mapped_parts)
-  combined.save_to_disk(out_dir.as_posix())
 
-  # Save metadata for reproducibility and downstream inspection.
-  manifest = {
-    "generated_at": datetime.now(timezone.utc).isoformat(),
-    "num_rows": len(combined),
-    "tasks": [task.__dict__ for task in tasks],
-  }
-  (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+def _source_name(task: TaskSpec, split: str) -> str:
+  # Keep source as dataset/subset only (no split stored in DB).
+  _ = split
+  base = task.dataset if task.subset is None else f"{task.dataset}:{task.subset}"
+  return base
+
+
+def _insert_task_samples(con: duckdb.DuckDBPyConnection, task: TaskSpec, cache_dir: Optional[str]):
+  # Load a task dataset and insert normalized sample rows.
+  # We call `load_dataset` without split=... so we can iterate all available splits.
+  ds_dict = load_dataset(task.dataset, task.subset, cache_dir=cache_dir)
+  selected_splits = _iter_selected_splits(task, ds_dict)
+
+  total_inserted = 0
+  total_skipped = 0
+
+  for split in selected_splits:
+    ds = ds_dict[split]
+    # Resolve dataset-specific schema to our canonical sequence/label fields.
+    sequence_col = _resolve_column(ds.column_names, task.sequence_col, SEQ_COL_CANDIDATES, "sequence", task.task_name)
+    label_col = _resolve_column(ds.column_names, task.label_col, LABEL_COL_CANDIDATES, "label", task.task_name)
+    source = _source_name(task, split)
+
+    rows = []
+    for ex in ds:
+      seq = ex.get(sequence_col)
+      if seq is None:
+        total_skipped += 1
+        continue
+
+      seq = str(seq).strip()
+      if seq == "":
+        total_skipped += 1
+        continue
+
+      lbl = _coerce_label(ex.get(label_col), task.dtype)
+      if lbl is None:
+        total_skipped += 1
+        continue
+
+      # Store labels as float regardless of task type.
+      rows.append((seq, source, task.task_name, lbl))
+
+      if len(rows) >= 5000:
+        # Batch inserts reduce Python<->DB call overhead significantly.
+        con.executemany(
+          """
+          INSERT INTO samples(sequence, source, task_name, label)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(sequence, task_name) DO UPDATE
+          -- Keep latest seen source/label when duplicate keys occur.
+          SET source = EXCLUDED.source,
+              label = EXCLUDED.label
+          """,
+          rows,
+        )
+        total_inserted += len(rows)
+        rows = []
+
+    if rows:
+      # Flush remaining rows after the final partial batch.
+      con.executemany(
+        """
+        INSERT INTO samples(sequence, source, task_name, label)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(sequence, task_name) DO UPDATE
+        -- Keep latest seen source/label when duplicate keys occur.
+        SET source = EXCLUDED.source,
+            label = EXCLUDED.label
+        """,
+        rows,
+      )
+      total_inserted += len(rows)
+
+  print(f"Task={task.task_name} inserted={total_inserted} skipped={total_skipped}")
+
+
+def aggregate(tasks: List[TaskSpec], out_db: Path, cache_dir: Optional[str]):
+  # Build the DuckDB file for all configured tasks.
+  # The output DB is self-contained and can be queried directly via DuckDB/SQLite-style SQL workflows.
+  out_db.parent.mkdir(parents=True, exist_ok=True)
+  con = duckdb.connect(out_db.as_posix())
+  try:
+    _prepare_db(con)
+
+    for task in tasks:
+      _insert_task(con, task)
+      _insert_task_samples(con, task, cache_dir)
+
+    total = con.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+    print(f"Aggregation complete: {total} sample rows written to {out_db}")
+  finally:
+    con.close()
 
 
 def _parse_args():
   # CLI arguments to set output and cache paths.
-  parser = argparse.ArgumentParser(description="Aggregate multiple datasets into a unified multi-task corpus.")
-  parser.add_argument("--out-dir", default="data/aggregated", help="Output directory for the combined dataset.")
+  parser = argparse.ArgumentParser(description="Aggregate multiple datasets into DuckDB tables.")
+  parser.add_argument("--out-db", default="data/aggregated/aggregated.duckdb", help="Output DuckDB file path.")
   parser.add_argument("--cache-dir", default=None, help="Optional HuggingFace datasets cache directory.")
   return parser.parse_args()
 
@@ -108,7 +287,7 @@ def _parse_args():
 def main():
   # Entrypoint for CLI usage.
   args = _parse_args()
-  aggregate(TASKS, Path(args.out_dir), args.cache_dir)
+  aggregate(TASKS, Path(args.out_db), args.cache_dir)
 
 
 if __name__ == "__main__":

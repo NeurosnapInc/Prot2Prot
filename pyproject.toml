@@ -21,6 +21,7 @@ dependencies = [
   "torch",
   "transformers",
   "sentencepiece",
+  "duckdb",
 ]
 
 [project.optional-dependencies]
