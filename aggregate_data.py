@@ -34,6 +34,9 @@ class TaskSpec:
   subset: Optional[str] = None
 
 
+# Source priority is defined by list order.
+# Earlier entries are considered higher quality and are inserted first.
+# Later entries cannot overwrite existing (sequence, task_name) rows.
 TASKS: List[TaskSpec] = [
   # Material production as sequence-level binary classification.
   TaskSpec(
@@ -162,13 +165,30 @@ def _prepare_db(con: duckdb.DuckDBPyConnection):
 
 def _insert_task(con: duckdb.DuckDBPyConnection, task: TaskSpec):
   # One metadata row per task head.
+  # If the same task_name appears multiple times, keep the first metadata row.
   con.execute(
     """
     INSERT INTO tasks(task_name, dtype, head_type, num_classes, loss)
     VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(task_name) DO NOTHING
     """,
     [task.task_name, task.dtype, task.head_type, task.num_classes, task.loss],
   )
+
+  # Ensure all sources that map to one task_name agree on metadata.
+  row = con.execute(
+    """
+    SELECT dtype, head_type, num_classes, loss
+    FROM tasks
+    WHERE task_name = ?
+    """,
+    [task.task_name],
+  ).fetchone()
+  if row != (task.dtype, task.head_type, task.num_classes, task.loss):
+    raise ValueError(
+      f"Inconsistent metadata for task '{task.task_name}'. "
+      f"Existing={row}, incoming={(task.dtype, task.head_type, task.num_classes, task.loss)}"
+    )
 
 
 def _iter_selected_splits(task: TaskSpec, ds_dict: Dict[str, Any]) -> List[str]:
@@ -194,8 +214,10 @@ def _insert_task_samples(con: duckdb.DuckDBPyConnection, task: TaskSpec, cache_d
   ds_dict = load_dataset(task.dataset, task.subset, cache_dir=cache_dir)
   selected_splits = _iter_selected_splits(task, ds_dict)
 
+  # Inserted count reflects rows accepted by DB uniqueness constraints.
   total_inserted = 0
   total_skipped = 0
+  total_conflicts = 0
 
   for split in selected_splits:
     ds = ds_dict[split]
@@ -225,37 +247,45 @@ def _insert_task_samples(con: duckdb.DuckDBPyConnection, task: TaskSpec, cache_d
       rows.append((seq, source, task.task_name, lbl))
 
       if len(rows) >= 5000:
-        # Batch inserts reduce Python<->DB call overhead significantly.
-        con.executemany(
-          """
-          INSERT INTO samples(sequence, source, task_name, label)
-          VALUES (?, ?, ?, ?)
-          ON CONFLICT(sequence, task_name) DO UPDATE
-          -- Keep latest seen source/label when duplicate keys occur.
-          SET source = EXCLUDED.source,
-              label = EXCLUDED.label
-          """,
-          rows,
-        )
-        total_inserted += len(rows)
+        # First dataset wins: conflicts are skipped via DO NOTHING.
+        # Row-wise RETURNING lets us count accepted vs conflicted rows.
+        for row in rows:
+          inserted = con.execute(
+            """
+            INSERT INTO samples(sequence, source, task_name, label)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(sequence, task_name) DO NOTHING
+            RETURNING 1
+            """,
+            row,
+          ).fetchone()
+          if inserted is None:
+            total_conflicts += 1
+          else:
+            total_inserted += 1
         rows = []
 
     if rows:
       # Flush remaining rows after the final partial batch.
-      con.executemany(
-        """
-        INSERT INTO samples(sequence, source, task_name, label)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(sequence, task_name) DO UPDATE
-        -- Keep latest seen source/label when duplicate keys occur.
-        SET source = EXCLUDED.source,
-            label = EXCLUDED.label
-        """,
-        rows,
-      )
-      total_inserted += len(rows)
+      for row in rows:
+        inserted = con.execute(
+          """
+          INSERT INTO samples(sequence, source, task_name, label)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(sequence, task_name) DO NOTHING
+          RETURNING 1
+          """,
+          row,
+        ).fetchone()
+        if inserted is None:
+          total_conflicts += 1
+        else:
+          total_inserted += 1
 
-  print(f"Task={task.task_name} inserted={total_inserted} skipped={total_skipped}")
+  print(
+    f"Task={task.task_name} inserted={total_inserted} "
+    f"skipped_missing={total_skipped} skipped_conflict={total_conflicts}"
+  )
 
 
 def aggregate(tasks: List[TaskSpec], out_db: Path, cache_dir: Optional[str]):
