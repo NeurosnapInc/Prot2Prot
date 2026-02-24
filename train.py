@@ -33,8 +33,8 @@ BATCH_SIZE = 8
 LR = 1e-4
 EPOCHS = 10
 MAX_LENGTH = 1024 * 2
-# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DEVICE = torch.device("cpu")  # TODO TMP
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# DEVICE = torch.device("cpu")  # TODO TMP
 
 
 def _validate_split_fractions():
