@@ -47,6 +47,13 @@ pip install -e .
 # training-only dependencies
 pip install -e ".[dev]"
 ```
+## Download ProteinGym
+```sh
+VERSION="v1.3"
+FILENAME="DMS_ProteinGym_substitutions.zip"
+curl -o ${FILENAME} https://marks.hms.harvard.edu/proteingym/ProteinGym_${VERSION}/${FILENAME}
+unzip ${FILENAME} && rm ${FILENAME}
+```
 
 ## Results (WIP)
 ### Crude Solubility Results for Reference
