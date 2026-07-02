@@ -4,6 +4,7 @@ Run multitask ProstT5 adapter inference from a raw amino-acid sequence or FASTA 
 
 import argparse
 import csv
+import gc
 import os
 import re
 from pathlib import Path
@@ -11,7 +12,7 @@ from pathlib import Path
 import torch
 from huggingface_hub import snapshot_download
 from neurosnap.sequence.align import read_msa
-from transformers import T5EncoderModel, T5Tokenizer
+from transformers import AutoConfig, T5EncoderModel, T5Tokenizer
 
 from config import (
   ADAPTER_DIM,
@@ -105,6 +106,36 @@ def should_use_local_files_only(args) -> bool:
   return bool(getattr(args, "local_files_only", False) or env_enabled)
 
 
+def load_encoder_model(model_name: str, local_files_only: bool = False):
+  """Load the ProstT5 encoder while avoiding slow non-mmap meta checkpoint scans."""
+  config = AutoConfig.from_pretrained(model_name, local_files_only=local_files_only)
+  model_dir = Path(snapshot_download(repo_id=model_name, local_files_only=local_files_only))
+  weights_path = model_dir / "pytorch_model.bin"
+  if not weights_path.exists():
+    raise FileNotFoundError(f"Expected ProstT5 PyTorch weights at {weights_path}.")
+
+  try:
+    state_dict = torch.load(weights_path, map_location="cpu", weights_only=True, mmap=True)
+  except TypeError:
+    state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
+
+  for key in list(state_dict.keys()):
+    if key.startswith("decoder.") or key.startswith("lm_head."):
+      del state_dict[key]
+  if "shared.weight" in state_dict and "encoder.embed_tokens.weight" not in state_dict:
+    state_dict["encoder.embed_tokens.weight"] = state_dict["shared.weight"]
+
+  base_model = T5EncoderModel(config)
+  base_model.load_state_dict(state_dict, strict=False)
+  base_model.tie_weights()
+  del state_dict
+  gc.collect()
+
+  if DEVICE.type == "cuda":
+    base_model.bfloat16()
+  return base_model.to(DEVICE)
+
+
 def load_model_and_tokenizer(checkpoint_path: Path, local_files_only: bool = False):
   checkpoint = torch.load(checkpoint_path, map_location="cpu")
   model_config = checkpoint["config"]
@@ -128,9 +159,7 @@ def load_model_and_tokenizer(checkpoint_path: Path, local_files_only: bool = Fal
     task_adapter_dim = model_config.get("task_adapter_dim", TASK_ADAPTER_DIM)
 
   tokenizer = T5Tokenizer.from_pretrained(model_name, do_lower_case=False, local_files_only=local_files_only)
-  base_model = T5EncoderModel.from_pretrained(model_name, local_files_only=local_files_only).to(DEVICE)
-  if DEVICE.type == "cuda":
-    base_model.bfloat16()
+  base_model = load_encoder_model(model_name, local_files_only=local_files_only)
 
   model = MultiTaskAdapterModel(
     base_model,
